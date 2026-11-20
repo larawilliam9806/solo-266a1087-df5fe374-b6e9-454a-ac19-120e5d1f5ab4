@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ code }} · 旧报纸价目表录入{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>{{ code }}</h1>
+  <p class="notice bad">{{ message }}</p>
+  <p><a class="button" href="{{ url_for('index') }}">返回任务列表</a></p>
+</section>
+{% endblock %}

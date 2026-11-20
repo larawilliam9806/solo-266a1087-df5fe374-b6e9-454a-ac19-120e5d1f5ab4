@@ -1,0 +1,11 @@
+{
+  "name": "pricing-entry-ui-tests",
+  "private": true,
+  "description": "Headless UI smoke tests for the price-list entry page (jsdom).",
+  "scripts": {
+    "test:ui": "node tests/ui_smoke.js && node tests/ui_lines.js"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
+}

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}任务列表 · 旧报纸价目表录入{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>旧报纸价目表录入</h1>
+  <p class="muted">
+    上传单页 OCR CSV（框号、文字、矩形坐标），对照文字框划定行线与
+    品名 / 规格 / 批发价 三列，核对跨格框后导出三列 CSV。
+  </p>
+  <form class="upload" method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv,text/csv,text/plain" required>
+    <button type="submit">上传并开始</button>
+  </form>
+  <details class="help">
+    <summary>CSV 格式说明</summary>
+    <p>表头可用中文或英文，例如：</p>
+    <pre>框号,文字,x1,y1,x2,y2
+1,白砂糖,120,80,260,110
+2,一级,270,80,360,110</pre>
+    <p>也支持 <code>框号,文字,矩形坐标</code>（坐标写成 <code>120,80,260,110</code>）、
+      <code>left/top/right/bottom</code> 或 <code>x/y/宽/高</code>。无表头时按
+      <code>框号,文字,x1,y1,x2,y2</code> 读取。</p>
+  </details>
+</section>
+
+<section class="card">
+  <h2>任务</h2>
+  {% if jobs %}
+  <table class="jobs">
+    <thead>
+      <tr><th>#</th><th>文件</th><th>文字框</th><th>格线</th><th>创建时间</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for job in jobs %}
+      <tr>
+        <td>{{ job.id }}</td>
+        <td><a href="{{ url_for('job_view', job_id=job.id) }}">{{ job.filename }}</a></td>
+        <td>{{ job.box_count }}</td>
+        <td>{{ job.line_count }}</td>
+        <td class="muted">{{ job.created_at }}</td>
+        <td class="right">
+          <a class="button" href="{{ url_for('job_view', job_id=job.id) }}">打开</a>
+          <form method="post" action="{{ url_for('job_delete', job_id=job.id) }}"
+                onsubmit="return confirm('删除任务 {{ job.id }} 及其全部框和格线？');">
+            <button class="danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有任务，请先上传一份 OCR CSV。</p>
+  {% endif %}
+</section>
+{% endblock %}

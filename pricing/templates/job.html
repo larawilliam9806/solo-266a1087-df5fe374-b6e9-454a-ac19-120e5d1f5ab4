@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}任务 {{ job.id }} · 旧报纸价目表录入{% endblock %}
+{% block topbar %}
+  <span class="crumb">{{ job.filename }}</span>
+  <a class="button{% if state.can_export %} primary{% else %} disabled{% endif %}"
+     id="download-link"
+     {% if state.can_export %}href="{{ url_for('export_csv', job_id=job.id) }}"{% else %}title="没有待核框后才可下载" aria-disabled="true"{% endif %}>下载三列 CSV</a>
+{% endblock %}
+
+{% block content %}
+<section class="card" id="status-card">
+  <div class="statusline">
+    <div>
+      <strong>状态：</strong><span id="status-pill"></span>
+      <span class="muted" id="status-counts"></span>
+    </div>
+    <form method="post" action="{{ url_for('job_delete', job_id=job.id) }}"
+          onsubmit="return confirm('删除任务 {{ job.id }} 及其全部框和格线？');">
+      <button class="danger ghost" type="submit">删除任务</button>
+    </form>
+  </div>
+  <p class="notice bad" id="invalid-message" {% if state.grid_valid %}hidden{% endif %}></p>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>文字框与格线</h2>
+    <div class="legend">
+      <span><i class="swatch auto"></i>自动</span>
+      <span><i class="swatch manual"></i>人工</span>
+      <span><i class="swatch pending"></i>待核</span>
+      <span><i class="swatch stale"></i>待重确认</span>
+      <span><i class="swatch excluded"></i>已排除</span>
+    </div>
+  </div>
+  <div class="viewer" id="viewer" data-job-id="{{ job.id }}">
+    <div class="canvas-wrap">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg" tabindex="0">
+        <rect id="page-bg" x="0" y="0" width="1" height="1"></rect>
+        <g id="grid-lines"></g>
+        <g id="boxes"></g>
+        <g id="line-hits"></g>
+      </svg>
+      <div class="hint muted">
+        点击文字框查看详情并归位。拖动棕色格线可移动；双击格线可删除。“应用格线”后重新计算归位。
+      </div>
+    </div>
+    <aside class="inspector" id="inspector">
+      <p class="muted">点击一个文字框查看详情。</p>
+    </aside>
+  </div>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>格线</h2>
+    <div class="line-actions">
+      <button type="button" id="add-horizontal">添加横线</button>
+      <button type="button" id="add-vertical">添加竖线</button>
+      <button type="button" id="suggest-lines">按文字框提议</button>
+      <button type="button" id="reset-lines">还原已应用</button>
+      <button type="button" class="primary" id="apply-lines">应用格线</button>
+    </div>
+  </div>
+  <p class="muted">
+    竖线必须恰好 4 条（左边界、两条分隔、右边界），横线至少 2 条。
+    增删或移动格线后，只有相交格及其边界都未变的人工决定会沿用，其余回到待核；
+    格线无效时会拒绝应用，保留原布局与归位结果。
+  </p>
+  <div class="line-editors">
+    <label>竖线 x 坐标
+      <input id="vertical-input" value="{{ state.vertical|join(', ') }}"
+             placeholder="例如 60, 300, 560, 800" inputmode="decimal">
+    </label>
+    <label>横线 y 坐标
+      <input id="horizontal-input" value="{{ state.horizontal|join(', ') }}"
+             placeholder="例如 40, 120, 200, 880" inputmode="decimal">
+    </label>
+  </div>
+  <p class="error" id="line-error" hidden></p>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>导出预览</h2>
+    <span class="muted">同格文字按从上到下、同高从左到右拼接</span>
+  </div>
+  <table class="preview{% if not state.rows %} empty{% endif %}" id="preview-table">
+    <thead><tr><th>行</th><th>品名</th><th>规格</th><th>批发价</th></tr></thead>
+    <tbody>
+      {% for row in state.rows %}
+      <tr>
+        <td class="muted">{{ row.row }}</td>
+        <td>{{ row.name }}</td>
+        <td>{{ row.spec }}</td>
+        <td>{{ row.price }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted" id="preview-empty" {% if state.rows %}hidden{% endif %}>暂无可导出的行。</p>
+  <p class="notice warn" id="pending-notice" {% if not state.pending %}hidden{% endif %}>
+    还有 <span id="pending-count">{{ state.pending }}</span> 个文字框待核对，全部处理完才能下载。
+  </p>
+</section>
+
+<script id="initial-state" type="application/json">{{ state_json|tojson }}</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% endblock %}

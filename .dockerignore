@@ -1,0 +1,14 @@
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+*.sqlite3
+*.sqlite3-journal
+tests
+node_modules
+package.json
+package-lock.json
+sample
+README.md
