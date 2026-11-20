@@ -23,6 +23,12 @@ STATUS_LABELS = {
     "excluded": "已排除",
 }
 
+# Cells whose entire text is one of these tokens repeat the previous row's
+# expanded value in the same column.  The comparison is exact after trimming,
+# so "〃 附注" is ordinary content, not a shorthand.
+SHORTHAND_TOKENS = ("〃", "同上")
+GROUP_COLUMNS = ("name", "spec")
+
 
 class LayoutError(ValueError):
     """The submitted ruling lines cannot produce the required 3-column grid."""
@@ -422,8 +428,223 @@ def build_rows(evaluated):
 
 
 # ---------------------------------------------------------------------------
-# Decision validation
+# Shorthand expansion ("〃" / "同上")
 # ---------------------------------------------------------------------------
+
+def build_row_grid(evaluated, row_count):
+    """One entry per grid row, including rows that ended up completely blank.
+
+    The three-column export skips blank rows, but expansion needs every row:
+    a blank cell is what breaks a "〃" inheritance chain, and a row that is
+    still waiting for a human decision may become non-blank later.
+    """
+    placed = [item for item in evaluated
+              if item["status"] in ("assigned_auto", "assigned_manual")]
+    by_row = {}
+    for item in placed:
+        by_row.setdefault(item["row"], []).append(item)
+
+    output = []
+    for row_index in range(max(row_count, 0)):
+        cells = by_row.get(row_index, [])
+        columns = {"name": [], "spec": [], "price": []}
+        for item in cells:
+            columns[item["column"]].append(item)
+        row = {"row": row_index + 1}
+        for column in COLUMNS:
+            row[column] = "".join(entry["text"] for entry in reading_order(columns[column]))
+        row["empty"] = not any(row[column].strip() for column in COLUMNS)
+        output.append(row)
+    return output
+
+
+def is_shorthand(text):
+    """True only when the whole cell is exactly "〃" or "同上"."""
+    return (text or "").strip() in SHORTHAND_TOKENS
+
+
+def evaluate_groups(horizontal, marks):
+    """Resolve saved group marks against the current horizontal lines.
+
+    A mark is usable only while its exact y coordinate is still an inner
+    horizontal line.  Marks that lost their line are remembered as invalid by
+    the caller, so restoring the same coordinate later does not silently
+    revive the old confirmation.
+
+    Returns {valid, invalid, starts} where `starts` is the set of 0-based grid
+    row indices that begin a new group (the first row always does).
+    """
+    lines = sorted(horizontal)
+    inner = {fmt(lines[index]): index for index in range(1, len(lines) - 1)}
+    valid = []
+    invalid = []
+    used = set()
+    for mark in marks:
+        try:
+            position = round(float(mark["position"]), COORD_DIGITS)
+        except (TypeError, ValueError):
+            continue
+        key = fmt(position)
+        row_index = inner.get(key)
+        bad = bool(mark.get("invalid")) or row_index is None
+        entry = {
+            "position": position,
+            "row": (row_index + 1) if row_index is not None else None,
+            "cell_key": mark.get("cell_key") or "",
+        }
+        if bad:
+            entry["reason"] = (
+                "原标记位置已没有内横线" if row_index is None
+                else "格线改动后需要重新确认"
+            )
+            invalid.append(entry)
+            continue
+        if key in used:
+            continue
+        used.add(key)
+        valid.append(entry)
+    valid.sort(key=lambda item: item["position"])
+    invalid.sort(key=lambda item: item["position"])
+    starts = sorted({entry["row"] - 1 for entry in valid})
+    return {"valid": valid, "invalid": invalid, "starts": starts}
+
+
+def pending_risk_rows(evaluated):
+    """Map 0-based grid row -> box refs that a pending decision may place there.
+
+    A pending box with no overlapping cell can only be excluded, so it cannot
+    change any row and is ignored.
+    """
+    risk = {}
+    for item in evaluated:
+        if item["status"] not in ("pending", "stale"):
+            continue
+        for candidate in item["candidates"]:
+            risk.setdefault(candidate["row"], []).append(
+                item["box_ref"] or str(item["box_id"])
+            )
+    return risk
+
+
+def expand_rows(rows, group_starts, risk_rows=None):
+    """Resolve "〃" / "同上" row by row and flag rows that need review.
+
+    Rules:
+      * only a cell whose entire content is "〃" or "同上" inherits;
+      * it inherits the previous row's *expanded* value in the same column;
+      * only within one group (groups start at a marked group line and at the
+        first row);
+      * a blank cell ends the chain — the next "〃" has nothing to reuse;
+      * the 批发价 column is never expanded and keeps its original text.
+
+    A row is undetermined when a shorthand has no value to reuse, or when a
+    pending/stale box may change the row or one of the rows it inherits from.
+    """
+    risk_rows = risk_rows or {}
+    starts = sorted(set(group_starts or []) | {0})
+    previous = {column: None for column in GROUP_COLUMNS}
+    output = []
+    group_no = 0
+    group_start = starts[0] if starts else 0
+
+    for index, row in enumerate(rows):
+        if index in starts:
+            group_no += 1
+            group_start = index
+            previous = {column: None for column in GROUP_COLUMNS}
+
+        result = {
+            "row": row["row"],
+            "group": group_no,
+            "name": "",
+            "spec": "",
+            "price": row["price"],
+            "name_source": None,
+            "spec_source": None,
+            "empty": row.get("empty", False),
+            "status": "determined",
+            "reasons": [],
+            "export_status": "export",
+        }
+        reasons = []
+
+        inherited = False
+        chain_start = group_start
+        for column in GROUP_COLUMNS:
+            raw = row[column]
+            if not is_shorthand(raw):
+                value = raw
+                result[column] = value
+                if value.strip():
+                    previous[column] = {"state": "ok", "value": value,
+                                        "source": row["row"], "row": row["row"]}
+                else:
+                    previous[column] = {"state": "blank", "row": row["row"]}
+                continue
+
+            inherited = True
+            prior = previous[column]
+            if prior is None:
+                reasons.append({
+                    "reason": "组首行没有可沿用的上一行",
+                    "rows": [row["row"]],
+                })
+                previous[column] = {"state": "unresolved", "row": row["row"]}
+            elif prior["state"] == "blank":
+                reasons.append({
+                    "reason": "上一行同列为空白，沿用在此中断",
+                    "rows": [prior["row"], row["row"]],
+                })
+                previous[column] = {"state": "unresolved", "row": row["row"]}
+            elif prior["state"] == "unresolved":
+                reasons.append({
+                    "reason": "上一行同列的沿用值尚未确定",
+                    "rows": [prior["row"], row["row"]],
+                })
+                previous[column] = {"state": "unresolved", "row": row["row"]}
+            else:
+                result[column] = prior["value"]
+                result[column + "_source"] = prior["source"]
+                chain_start = min(chain_start, prior["source"] - 1)
+                previous[column] = {"state": "ok", "value": prior["value"],
+                                    "source": prior["source"], "row": row["row"]}
+
+        own_risk = sorted(risk_rows.get(index, []))
+        if row.get("empty") and not own_risk:
+            # A row transcribed as nothing is padding, not a data row.
+            result["status"] = "blank"
+            result["export_status"] = "skip"
+            output.append(result)
+            continue
+
+        if own_risk:
+            reasons.append({
+                "reason": "有待核框可能改动本行",
+                "rows": [row["row"]],
+                "boxes": own_risk,
+            })
+
+        if inherited:
+            earlier_risk = sorted(
+                entry for entry in risk_rows
+                if chain_start <= entry < index
+            )
+            if earlier_risk:
+                reasons.append({
+                    "reason": "有待核框可能影响本行沿用的内容",
+                    "rows": sorted(set(entry + 1 for entry in earlier_risk)
+                                   | {row["row"]}),
+                })
+
+        if reasons:
+            result["status"] = "review"
+            result["reasons"] = reasons
+        if result["status"] != "determined":
+            result["export_status"] = "review"
+        elif not result["price"].strip():
+            result["export_status"] = "skip"
+        output.append(result)
+    return output
 
 
 def make_decision(grid, item, kind, target_key=None):

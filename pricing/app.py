@@ -62,8 +62,8 @@ def create_app(config=None):
         if connection is not None:
             connection.close()
 
-    def load_job_or_404(job_id):
-        job = db.get_job(get_db(), job_id)
+    def load_job_or_404(job_id, connection=None):
+        job = db.get_job(connection or get_db(), job_id)
         if job is None:
             abort(404)
         return job
@@ -71,9 +71,9 @@ def create_app(config=None):
     # ------------------------------------------------------------------
     # State computation shared by pages and API
     # ------------------------------------------------------------------
-    def job_state(job_id):
-        connection = get_db()
-        job = load_job_or_404(job_id)
+    def job_state(job_id, connection=None):
+        connection = connection or get_db()
+        job = load_job_or_404(job_id, connection)
         boxes = db.get_boxes(connection, job_id)
         horizontal, vertical = db.get_lines(connection, job_id)
         invalid = None
@@ -99,16 +99,34 @@ def create_app(config=None):
             ]
             pending = sum(1 for item in evaluated if (item["text"] or "").strip())
             rows = []
+            row_grid = []
             if not invalid:
                 invalid = "尚未确认格线"
         else:
             evaluated = layout.evaluate(grid, boxes, decisions)
             pending = layout.pending_count(evaluated)
             rows = layout.build_rows(evaluated)
+            row_grid = layout.build_row_grid(evaluated, grid.rows)
+
+        groups = layout.evaluate_groups(
+            horizontal, db.get_group_lines(connection, job_id)
+        )
+        expansion = layout.expand_rows(
+            row_grid, groups["starts"], layout.pending_risk_rows(evaluated)
+        )
 
         status_counts = {}
         for item in evaluated:
             status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+
+        expand_block = None
+        if grid is None:
+            expand_block = invalid
+        elif groups["invalid"]:
+            expand_block = (
+                "有 %d 条分组线的标记位置已没有内横线，请重选或撤销分组线后再下载展开表"
+                % len(groups["invalid"])
+            )
 
         return {
             "job": job,
@@ -119,8 +137,14 @@ def create_app(config=None):
             "invalid": invalid,
             "pending": pending,
             "rows": rows,
+            "row_grid": row_grid,
+            "expansion": expansion,
+            "groups": groups,
             "status_counts": status_counts,
             "can_export": grid is not None and pending == 0 and bool(boxes),
+            "can_export_expanded": grid is not None and expand_block is None,
+            "expand_block": expand_block,
+            "revision": job.get("revision", db.get_revision(connection, job_id)),
             "cells": grid.cells() if grid is not None else [],
         }
 
@@ -167,7 +191,7 @@ def create_app(config=None):
         job_id = db.create_job(connection, filename)
         db.add_boxes(connection, job_id, parsed.boxes)
         horizontal, vertical = _suggest_lines(parsed.boxes)
-        db.set_lines(connection, job_id, horizontal, vertical)
+        db.apply_layout(connection, job_id, horizontal, vertical)
         for warning in parsed.warnings[:20]:
             flash(warning, "warning")
         flash(f"已导入 {len(parsed.boxes)} 个文字框，请核对格线", "success")
@@ -179,6 +203,14 @@ def create_app(config=None):
         state = job_state(job_id)
         return render_template(
             "job.html", job=job, state=state, state_json=_json_state(state)
+        )
+
+    @app.get("/jobs/<int:job_id>/expand")
+    def expand_view(job_id):
+        job = load_job_or_404(job_id)
+        state = job_state(job_id)
+        return render_template(
+            "expand.html", job=job, state=state, state_json=_json_state(state)
         )
 
     @app.post("/jobs/<int:job_id>/delete")
@@ -210,7 +242,99 @@ def create_app(config=None):
                 "error": error.message,
                 "details": error.details,
             }), 400
-        db.set_lines(get_db(), job_id, horizontal, vertical)
+        # Group marks are carried forward in the same write: each mark stays
+        # valid only while its coordinate is still an inner line, otherwise it
+        # is flagged and must be re-chosen or undone.
+        db.apply_layout(get_db(), job_id, horizontal, vertical)
+        return jsonify(_json_state(job_state(job_id)))
+
+    @app.post("/api/jobs/<int:job_id>/groups")
+    def api_set_groups(job_id):
+        """Save the confirmed group lines.
+
+        ``lines`` are the marks the clerk confirmed (each must now be an inner
+        horizontal line).  ``keep_invalid`` names previously flagged marks
+        that are to stay flagged: the page sends the ones it did not touch, so
+        confirming one lost mark cannot silently bless the others.  Every
+        other mark is dropped.  A mark that lost its line can never be saved
+        as valid, only re-confirmed or undone.
+        """
+        load_job_or_404(job_id)
+        state = job_state(job_id)
+        if not state["grid_valid"]:
+            return jsonify({"ok": False, "error": state["invalid"],
+                            "details": []}), 409
+        grid = layout.Grid(state["horizontal"], state["vertical"])
+        payload = request.get_json(silent=True) or {}
+        raw = payload.get("lines")
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list):
+            return jsonify({"ok": False, "error": "分组线必须是数组",
+                            "details": []}), 400
+        marks = []
+        seen = set()
+        for index, item in enumerate(raw):
+            value = item.get("position") if isinstance(item, dict) else item
+            try:
+                position = layout._as_number(value, f"第 {index + 1} 条分组线")
+            except layout.LayoutError as error:
+                return jsonify({"ok": False, "error": error.message,
+                                "details": [error.message]}), 400
+            key = layout.fmt(position)
+            if key in seen:
+                continue
+            seen.add(key)
+            row_index = layout.evaluate_groups(
+                state["horizontal"], [{"position": position}])["valid"]
+            if not row_index:
+                return jsonify({
+                    "ok": False,
+                    "error": f"y={layout.fmt(position)} 不是内横线，不能标为分组线",
+                    "details": [],
+                }), 400
+            marks.append({
+                "position": position,
+                "cell_key": grid.cell_key(row_index[0]["row"] - 1, 0),
+            })
+        connection = get_db()
+        old_marks = db.get_group_lines(connection, job_id)
+        db.replace_group_lines(connection, job_id, marks)
+        keep = payload.get("keep_invalid") or []
+        if keep:
+            confirmed = {layout.fmt(mark["position"]) for mark in marks}
+            kept = []
+            for value in keep:
+                try:
+                    position = layout._as_number(value, "保留的分组线")
+                except layout.LayoutError:
+                    continue
+                key = layout.fmt(position)
+                if key in confirmed:
+                    continue
+                old = next((mark for mark in old_marks
+                            if layout.fmt(mark["position"]) == key), None)
+                if old is None or not old.get("invalid"):
+                    continue
+                if layout.evaluate_groups(state["horizontal"], [old])["invalid"]:
+                    kept.append(old)
+            if kept:
+                db.replace_group_lines(
+                    connection, job_id,
+                    [dict(mark, invalid=1) for mark in kept]
+                    + [dict(mark, invalid=0) for mark in marks],
+                )
+        db.bump_revision(connection, job_id)
+        connection.commit()
+        return jsonify(_json_state(job_state(job_id)))
+
+    @app.delete("/api/jobs/<int:job_id>/groups")
+    def api_clear_groups(job_id):
+        load_job_or_404(job_id)
+        connection = get_db()
+        db.clear_group_lines(connection, job_id)
+        db.bump_revision(connection, job_id)
+        connection.commit()
         return jsonify(_json_state(job_state(job_id)))
 
     @app.post("/api/jobs/<int:job_id>/suggest-lines")
@@ -281,6 +405,60 @@ def create_app(config=None):
             },
         )
 
+    @app.get("/jobs/<int:job_id>/export-expanded.csv")
+    def export_expanded_csv(job_id):
+        """Download the expanded table from one consistent job snapshot.
+
+        Everything below -- the group marks, the boxes, the decisions and the
+        CSV itself -- is read from one connection with one revision, so edits
+        that land while the file is being produced cannot mix two versions.
+        """
+        connection = db.connect(app.config["DATABASE"])
+        try:
+            # One read snapshot for the whole file: group marks, boxes,
+            # decisions and rows all come from the same revision even if an
+            # edit is saved while the CSV is being written.  The first read
+            # pins a WAL snapshot for the rest of the transaction.
+            connection.execute("BEGIN")
+            revision = db.get_revision(connection, job_id)
+            job = load_job_or_404(job_id, connection)
+            state = job_state(job_id, connection)
+            if not state["grid_valid"]:
+                abort(409, description=state["invalid"])
+            if state["groups"]["invalid"]:
+                abort(409, description=state["expand_block"])
+            if db.get_revision(connection, job_id) != revision:
+                abort(409, description="任务状态刚被修改，请重试下载")
+            buffer = io.StringIO()
+            writer = csv.writer(buffer, lineterminator="\r\n")
+            writer.writerow(["品名", "规格", "批发价",
+                             "品名来源行", "规格来源行"])
+            for row in state["expansion"]:
+                if row["export_status"] != "export":
+                    continue
+                writer.writerow([
+                    row["name"], row["spec"], row["price"],
+                    row["name_source"] if row["name_source"] else "",
+                    row["spec_source"] if row["spec_source"] else "",
+                ])
+            data = "﻿" + buffer.getvalue()
+            # This revision is what the file was built from; reporting it in a
+            # header lets a client notice an edit that landed after the read.
+            headers = {"X-Job-Revision": str(revision)}
+        finally:
+            connection.rollback()
+            connection.close()
+        name = Path(job["filename"]).stem or "pricelist"
+        headers["Content-Disposition"] = (
+            "attachment; filename*=UTF-8''"
+            f"{_quote_filename(name + '-展开表.csv')}"
+        )
+        return Response(
+            data,
+            mimetype="text/csv; charset=utf-8",
+            headers=headers,
+        )
+
     @app.errorhandler(413)
     def too_large(_error):
         flash("文件过大（上限 10MB）", "error")
@@ -310,8 +488,14 @@ def _json_state(state):
         "invalid": state["invalid"],
         "pending": state["pending"],
         "rows": state["rows"],
+        "row_grid": state["row_grid"],
+        "expansion": state["expansion"],
+        "groups": state["groups"],
         "status_counts": state["status_counts"],
         "can_export": state["can_export"],
+        "can_export_expanded": state["can_export_expanded"],
+        "expand_block": state["expand_block"],
+        "revision": state["revision"],
         "cells": state["cells"],
     }
 

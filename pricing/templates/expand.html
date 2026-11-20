@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}展开页 · 任务 {{ job.id }} · 旧报纸价目表录入{% endblock %}
+{% block topbar %}
+  <span class="crumb">{{ job.filename }}</span>
+  <a class="button" href="{{ url_for('job_view', job_id=job.id) }}">返回录入页</a>
+  <a class="button{% if state.can_export_expanded %} primary{% else %} disabled{% endif %}"
+     id="download-expanded-link"
+     {% if state.can_export_expanded %}href="{{ url_for('export_expanded_csv', job_id=job.id) }}"{% else %}title="{{ state.expand_block or '需要先确认分组线' }}" aria-disabled="true"{% endif %}>下载展开表 CSV</a>
+{% endblock %}
+
+{% block content %}
+<section class="card" id="status-card">
+  <div class="statusline">
+    <div>
+      <strong>展开页：</strong><span class="pill" id="group-pill"></span>
+      <span class="muted" id="group-summary"></span>
+    </div>
+  </div>
+  <p class="muted">
+    点击一条内横线可把它标为 / 取消分组线（草稿），再点“应用分组线”保存。
+    组内只有整格为“〃”或“同上”的单元格才沿用上一行同列展开后的值；
+    空白单元格打断沿用，批发价始终保留原文。
+  </p>
+  <p class="notice bad" id="expand-block" {% if not state.expand_block %}hidden{% endif %}>{{ state.expand_block or "" }}</p>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>格线与分组线</h2>
+    <div class="line-actions">
+      <button type="button" id="groups-apply">应用分组线</button>
+      <button type="button" class="danger" id="groups-clear">撤销全部分组线</button>
+    </div>
+  </div>
+  <div class="viewer" id="viewer" data-job-id="{{ job.id }}">
+    <div class="canvas-wrap">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg" tabindex="0">
+        <rect id="page-bg" x="0" y="0" width="1" height="1"></rect>
+        <g id="grid-lines"></g>
+        <g id="boxes"></g>
+        <g id="line-hits"></g>
+      </svg>
+      <div class="hint muted">
+        点击内横线增删分组线草稿（绿色粗线），点“应用分组线”保存。
+        拖动格线或改格线后，已保存的分组线若失去原位置会标红并阻止下载展开表，需重选或撤销。
+      </div>
+    </div>
+    <aside class="inspector" id="inspector">
+      <ul class="group-list" id="group-list"></ul>
+    </aside>
+  </div>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>展开表逐行预览</h2>
+    <span class="muted">“〃”“同上”按分组沿用；“来源行”是继承值最初出现的表内行号</span>
+  </div>
+  <table class="preview expanded{% if not state.expansion %} empty{% endif %}" id="expanded-table">
+    <thead>
+      <tr><th>行</th><th>组</th><th>品名</th><th>规格</th><th>批发价</th>
+          <th>品名来源行</th><th>规格来源行</th><th>状态 / 待核原因</th></tr>
+    </thead>
+    <tbody>
+      {% for row in state.expansion %}
+      <tr class="row-{{ row.export_status }}">
+        <td class="muted">{{ row.row }}</td>
+        <td class="muted">{{ row.group }}</td>
+        <td>{{ row.name }}</td>
+        <td>{{ row.spec }}</td>
+        <td>{{ row.price }}</td>
+        <td class="muted">{{ row.name_source or "" }}</td>
+        <td class="muted">{{ row.spec_source or "" }}</td>
+        <td>
+          {% if row.export_status == "export" %}
+          <span class="tag ok">已确定</span>
+          {% elif row.export_status == "skip" and row.status == "determined" %}
+          <span class="tag skip">批发价为空，不导出</span>
+          {% elif row.export_status == "skip" %}
+          <span class="tag skip">空白行，不导出</span>
+          {% else %}
+          <span class="tag review">待核</span>
+          <ul class="reasons">
+            {% for reason in row.reasons %}
+            <li>{{ reason.reason }}：涉及第 {{ reason.rows|join("、") }} 行
+              {% if reason.boxes %}（框 {{ reason.boxes|join("、") }}）{% endif %}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="muted" id="expanded-empty" {% if state.expansion %}hidden{% endif %}>尚无可展开的行。</p>
+  <p class="muted">展开表只收已确定且批发价非空的行；待核行标注原因和涉及的行号。</p>
+</section>
+
+<script id="initial-state" type="application/json">{{ state_json|tojson }}</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='expand.js') }}"></script>
+{% endblock %}

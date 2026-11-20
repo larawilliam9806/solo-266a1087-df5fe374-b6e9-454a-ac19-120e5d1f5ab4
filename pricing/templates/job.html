@@ -2,6 +2,7 @@
 {% block title %}任务 {{ job.id }} · 旧报纸价目表录入{% endblock %}
 {% block topbar %}
   <span class="crumb">{{ job.filename }}</span>
+  <a class="button" href="{{ url_for('expand_view', job_id=job.id) }}">展开页</a>
   <a class="button{% if state.can_export %} primary{% else %} disabled{% endif %}"
      id="download-link"
      {% if state.can_export %}href="{{ url_for('export_csv', job_id=job.id) }}"{% else %}title="没有待核框后才可下载" aria-disabled="true"{% endif %}>下载三列 CSV</a>

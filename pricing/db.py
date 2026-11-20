@@ -24,9 +24,20 @@ def init_db(path):
     connection = connect(path)
     try:
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        _migrate(connection)
         connection.commit()
     finally:
         connection.close()
+
+
+def _migrate(connection):
+    """Bring an older database file up to the current schema."""
+    columns = {row["name"] for row in
+               connection.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "revision" not in columns:
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _rows_to_dicts(rows):
@@ -86,21 +97,6 @@ def get_boxes(connection, job_id):
     return _rows_to_dicts(rows)
 
 
-def set_lines(connection, job_id, horizontal, vertical):
-    connection.execute("DELETE FROM lines WHERE job_id = ?", (job_id,))
-    for position in horizontal:
-        connection.execute(
-            "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'h', ?)",
-            (job_id, position),
-        )
-    for position in vertical:
-        connection.execute(
-            "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'v', ?)",
-            (job_id, position),
-        )
-    connection.commit()
-
-
 def get_lines(connection, job_id):
     rows = connection.execute(
         "SELECT orientation, position FROM lines WHERE job_id = ?"
@@ -145,4 +141,88 @@ def clear_decision(connection, job_id, box_id):
     connection.execute(
         "DELETE FROM decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
     )
+    connection.commit()
+
+
+# ---------------------------------------------------------------------------
+# Revision: one number that advances with every edit that can change rows or
+# groups.  An expansion download records it up front and the CSV is built from
+# that same snapshot, so interleaved edits can never mix two versions.
+# ---------------------------------------------------------------------------
+
+def bump_revision(connection, job_id):
+    """Advance and return the job's revision (caller commits)."""
+    connection.execute(
+        "UPDATE jobs SET revision = revision + 1 WHERE id = ?", (job_id,)
+    )
+    row = connection.execute(
+        "SELECT revision FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    return row["revision"] if row else 0
+
+
+def get_revision(connection, job_id):
+    row = connection.execute(
+        "SELECT revision FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    return row["revision"] if row else 0
+
+
+def apply_layout(connection, job_id, horizontal, vertical):
+    """Replace the lines and carry group marks forward, in one transaction.
+
+    A mark survives an edit only while its exact y coordinate stays an inner
+    horizontal line.  Otherwise it is flagged invalid and stays flagged: even
+    if a later edit restores the same coordinate, the clerk has to confirm or
+    undo the group line explicitly.
+    """
+    connection.execute("DELETE FROM lines WHERE job_id = ?", (job_id,))
+    for position in horizontal:
+        connection.execute(
+            "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'h', ?)",
+            (job_id, position),
+        )
+    for position in vertical:
+        connection.execute(
+            "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'v', ?)",
+            (job_id, position),
+        )
+    inner = {round(float(value), 2) for value in horizontal[1:-1]}
+    marks = get_group_lines(connection, job_id)
+    for mark in marks:
+        if mark.get("invalid"):
+            continue
+        if round(float(mark["position"]), 2) not in inner:
+            mark["invalid"] = 1
+    replace_group_lines(connection, job_id, marks)
+    revision = bump_revision(connection, job_id)
+    connection.commit()
+    return revision
+
+
+def get_group_lines(connection, job_id):
+    rows = connection.execute(
+        "SELECT * FROM group_lines WHERE job_id = ? ORDER BY position", (job_id,)
+    ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def replace_group_lines(connection, job_id, marks):
+    """Replace every group mark for the job (caller commits).
+
+    marks is an iterable of {cell_key, position, group_no, invalid}.
+    """
+    connection.execute("DELETE FROM group_lines WHERE job_id = ?", (job_id,))
+    ordered = sorted(marks, key=lambda mark: (mark["position"], mark["cell_key"]))
+    for group_no, mark in enumerate(ordered, start=1):
+        connection.execute(
+            "INSERT INTO group_lines (job_id, cell_key, position, group_no, invalid)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (job_id, mark["cell_key"], mark["position"], group_no,
+             1 if mark.get("invalid") else 0),
+        )
+
+
+def clear_group_lines(connection, job_id):
+    connection.execute("DELETE FROM group_lines WHERE job_id = ?", (job_id,))
     connection.commit()
